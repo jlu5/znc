@@ -1,0 +1,7 @@
+znc source: source-contains-prebuilt-javascript-object webskins/_default_/pub/jquery-*.min.js
+znc source: source-contains-prebuilt-javascript-object webskins/_default_/pub/selectize-standalone-*.min.js
+znc source: source-contains-empty-directory docker/
+znc source: source-contains-empty-directory third_party/googletest/
+
+# there are vcs, but are private
+znc source: co-maintained-package-with-no-vcs-fields
