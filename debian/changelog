@@ -1,3 +1,12 @@
+znc (1.7.5-1.1) UNRELEASED; urgency=medium
+
+  * Non-maintainer upload.
+  * Add patch 0001-Rework-MODE-RPL_CHANMODEIS-handling-for-trailing-arg.patch
+    from https://github.com/znc/znc/commit/95369455fcbc95f8064253b1e72c8b9bc83b6e98
+    - Fix channel mode tracking on InspIRCd 3.x
+
+ -- James Lu <james@overdrivenetworks.com>  Tue, 29 Oct 2019 21:06:32 -0700
+
 znc (1.7.5-1) unstable; urgency=medium
 
   * New upstream release.

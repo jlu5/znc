@@ -1,0 +1,377 @@
+From: "Aspen (linudaemon)" <linuxdaemon.irc@gmail.com>
+Date: Thu, 8 Aug 2019 15:54:49 -0500
+Subject: Rework MODE/RPL_CHANMODEIS handling for trailing args (#1661)
+
+Some servers may send a colon even if the last parameter doesn't need it, currently this leads to issues with permission/mode tracking, as the core doesn't handle the colon properly.
+
+This fix replaces reconstructing the parameter string with just passing a vector of the relevant parameters to CChan::SetModes() and adds overrides for CChan::SetModes() and CChan::ModeChange() that accept the vector instead.
+
+Clean up uses of old CModeMessage::GetModes()
+---
+ include/znc/Chan.h    | 14 +++++++++++++
+ include/znc/Message.h | 19 ++++++++++++++++++
+ src/Chan.cpp          | 55 ++++++++++++++++++++++++++++++++++++++++-----------
+ src/Client.cpp        |  3 +--
+ src/IRCSock.cpp       | 12 +++++------
+ src/Message.cpp       | 20 +++++++++++++++++++
+ test/IRCSockTest.cpp  | 17 ++++++++++++++++
+ test/MessageTest.cpp  | 44 +++++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 165 insertions(+), 19 deletions(-)
+
+diff --git a/include/znc/Chan.h b/include/znc/Chan.h
+index 47bc21d..c3c756e 100644
+--- a/include/znc/Chan.h
++++ b/include/znc/Chan.h
+@@ -76,8 +76,22 @@ class CChan : private CCoreTranslationMixin {
+                const CString& sHost);
+ 
+     // Modes
++    /// @deprecated Use SetModes(CString, VCString)
+     void SetModes(const CString& s);
++    /**
++     * Set the current modes for this channel
++     * @param sModes The mode characters being changed
++     * @param vsModeParams The parameters for the modes to be set
++     */
++    void SetModes(const CString& sModes, const VCString& vsModeParams);
++    /// @deprecated Use ModeChange(CString, VCString, CNick*)
+     void ModeChange(const CString& sModes, const CNick* OpNick = nullptr);
++    /**
++     * Handle changing the modes on a channel
++     * @param sModes The mode string (eg. +ovbs-pbo)
++     * @param vsModeParams The parameters for the mode string
++     */
++    void ModeChange(const CString& sModes,const VCString& vsModeParams, const CNick* OpNick = nullptr);
+     bool AddMode(char cMode, const CString& sArg);
+     bool RemMode(char cMode);
+     CString GetModeString() const;
+diff --git a/include/znc/Message.h b/include/znc/Message.h
+index 1981d31..2edce73 100644
+--- a/include/znc/Message.h
++++ b/include/znc/Message.h
+@@ -121,6 +121,18 @@ class CMessage {
+     void SetCommand(const CString& sCommand);
+ 
+     const VCString& GetParams() const { return m_vsParams; }
++
++    /**
++     * Get a subset of the message parameters
++     *
++     * This allows accessing a vector of a specific range of parameters,
++     * allowing easy inline use, such as `pChan->SetModes(Message.GetParam(2), Message.GetParamsSplit(3));`
++     *
++     * @param uIdx The index of the first parameter to retrieve
++     * @param uLen How many parameters to retrieve
++     * @return A VCString containing the retrieved parameters
++     */
++    VCString GetParamsSplit(unsigned int uIdx, unsigned int uLen = -1) const;
+     void SetParams(const VCString& vsParams);
+ 
+     /// @deprecated use GetParamsColon() instead.
+@@ -257,7 +269,14 @@ REGISTER_ZNC_MESSAGE(CJoinMessage);
+ 
+ class CModeMessage : public CTargetMessage {
+   public:
++    /// @deprecated Use GetModeList() and GetModeParams()
+     CString GetModes() const { return GetParamsColon(1).TrimPrefix_n(":"); }
++
++    CString GetModeList() const { return GetParam(1); };
++
++    VCString GetModeParams() const { return GetParamsSplit(2); };
++
++    bool HasModes() const { return !GetModeList().empty(); };
+ };
+ REGISTER_ZNC_MESSAGE(CModeMessage);
+ 
+diff --git a/src/Chan.cpp b/src/Chan.cpp
+index 1d6a079..955866c 100644
+--- a/src/Chan.cpp
++++ b/src/Chan.cpp
+@@ -260,6 +260,11 @@ void CChan::SetModes(const CString& sModes) {
+     ModeChange(sModes);
+ }
+ 
++void CChan::SetModes(const CString& modes, const VCString& vsModeParams) {
++    m_mcsModes.clear();
++    ModeChange(modes, vsModeParams);
++}
++
+ void CChan::SetAutoClearChanBuffer(bool b) {
+     m_bHasAutoClearChanBufferSet = true;
+     m_bAutoClearChanBuffer = b;
+@@ -295,9 +300,7 @@ void CChan::OnWho(const CString& sNick, const CString& sIdent,
+     }
+ }
+ 
+-void CChan::ModeChange(const CString& sModes, const CNick* pOpNick) {
+-    CString sModeArg = sModes.Token(0);
+-    CString sArgs = sModes.Token(1, true);
++void CChan::ModeChange(const CString& sModes, const VCString& vsModes, const CNick* pOpNick) {
+     bool bAdd = true;
+ 
+     /* Try to find a CNick* from this channel so that pOpNick->HasPerm()
+@@ -309,18 +312,22 @@ void CChan::ModeChange(const CString& sModes, const CNick* pOpNick) {
+         if (OpNick) pOpNick = OpNick;
+     }
+ 
+-    NETWORKMODULECALL(OnRawMode2(pOpNick, *this, sModeArg, sArgs),
+-                      m_pNetwork->GetUser(), m_pNetwork, nullptr, NOTHING);
++    {
++        CString sArgs = CString(" ").Join(vsModes.begin(), vsModes.end());
++        NETWORKMODULECALL(OnRawMode2(pOpNick, *this, sModes, sArgs),
++                          m_pNetwork->GetUser(), m_pNetwork, nullptr, NOTHING);
++    }
+ 
+-    for (unsigned int a = 0; a < sModeArg.size(); a++) {
+-        const char& cMode = sModeArg[a];
++    VCString::const_iterator argIter = vsModes.begin();
++    for (unsigned int a = 0; a < sModes.size(); a++) {
++        const char& cMode = sModes[a];
+ 
+         if (cMode == '+') {
+             bAdd = true;
+         } else if (cMode == '-') {
+             bAdd = false;
+         } else if (m_pNetwork->GetIRCSock()->IsPermMode(cMode)) {
+-            CString sArg = GetModeArg(sArgs);
++            CString sArg = *argIter++;
+             CNick* pNick = FindNick(sArg);
+             if (pNick) {
+                 char cPerm =
+@@ -382,16 +389,16 @@ void CChan::ModeChange(const CString& sModes, const CNick* pOpNick) {
+             switch (m_pNetwork->GetIRCSock()->GetModeType(cMode)) {
+                 case CIRCSock::ListArg:
+                     bList = true;
+-                    sArg = GetModeArg(sArgs);
++                    sArg = *argIter++;
+                     break;
+                 case CIRCSock::HasArg:
+-                    sArg = GetModeArg(sArgs);
++                    sArg = *argIter++;
+                     break;
+                 case CIRCSock::NoArg:
+                     break;
+                 case CIRCSock::ArgWhenSet:
+                     if (bAdd) {
+-                        sArg = GetModeArg(sArgs);
++                        sArg = *argIter++;
+                     }
+ 
+                     break;
+@@ -423,6 +430,32 @@ void CChan::ModeChange(const CString& sModes, const CNick* pOpNick) {
+     }
+ }
+ 
++void CChan::ModeChange(const CString& sModes, const CNick* pOpNick) {
++    VCString vsModes;
++    CString sModeArg = sModes.Token(0);
++    bool colon = sModeArg.TrimPrefix(":");
++
++    // Only handle parameters if sModes doesn't start with a colon
++    // because if it does, we only have the mode string with no parameters
++    if (!colon) {
++        CString sArgs = sModes.Token(1, true);
++
++        while (!sArgs.empty()) {
++            // Check if this parameter is a trailing parameter
++            // If so, treat the rest of sArgs as one parameter
++            if (sArgs.TrimPrefix(":")) {
++                vsModes.push_back(sArgs);
++                sArgs.clear();
++            } else {
++                vsModes.push_back(sArgs.Token(0));
++                sArgs = sArgs.Token(1, true);
++            }
++        }
++    }
++
++    ModeChange(sModeArg, vsModes, pOpNick);
++}
++
+ CString CChan::GetOptions() const {
+     VCString vsRet;
+ 
+diff --git a/src/Client.cpp b/src/Client.cpp
+index c0efd62..94d0867 100644
+--- a/src/Client.cpp
++++ b/src/Client.cpp
+@@ -1086,9 +1086,8 @@ bool CClient::OnJoinMessage(CJoinMessage& Message) {
+ 
+ bool CClient::OnModeMessage(CModeMessage& Message) {
+     CString sTarget = Message.GetTarget();
+-    CString sModes = Message.GetModes();
+ 
+-    if (m_pNetwork && m_pNetwork->IsChan(sTarget) && sModes.empty()) {
++    if (m_pNetwork && m_pNetwork->IsChan(sTarget) && !Message.HasModes()) {
+         // If we are on that channel and already received a
+         // /mode reply from the server, we can answer this
+         // request ourself.
+diff --git a/src/IRCSock.cpp b/src/IRCSock.cpp
+index 34bb264..2a088e1 100644
+--- a/src/IRCSock.cpp
++++ b/src/IRCSock.cpp
+@@ -555,24 +555,24 @@ bool CIRCSock::OnKickMessage(CKickMessage& Message) {
+ bool CIRCSock::OnModeMessage(CModeMessage& Message) {
+     const CNick& Nick = Message.GetNick();
+     CString sTarget = Message.GetTarget();
+-    CString sModes = Message.GetModes();
++    VCString vsModes = Message.GetModeParams();
++    CString sModes = Message.GetModeList();
+ 
+     CChan* pChan = m_pNetwork->FindChan(sTarget);
+     if (pChan) {
+-        pChan->ModeChange(sModes, &Nick);
++        pChan->ModeChange(sModes, vsModes, &Nick);
+ 
+         if (pChan->IsDetached()) {
+             return true;
+         }
+     } else if (sTarget == m_Nick.GetNick()) {
+-        CString sModeArg = sModes.Token(0);
+         bool bAdd = true;
+         /* no module call defined (yet?)
+                 MODULECALL(OnRawUserMode(*pOpNick, *this, sModeArg, sArgs),
+            m_pNetwork->GetUser(), nullptr, );
+         */
+-        for (unsigned int a = 0; a < sModeArg.size(); a++) {
+-            const char& cMode = sModeArg[a];
++        for (unsigned int a = 0; a < sModes.size(); a++) {
++            const char& cMode = sModes[a];
+ 
+             if (cMode == '+') {
+                 bAdd = true;
+@@ -767,7 +767,7 @@ bool CIRCSock::OnNumericMessage(CNumericMessage& Message) {
+             CChan* pChan = m_pNetwork->FindChan(Message.GetParam(1));
+ 
+             if (pChan) {
+-                pChan->SetModes(Message.GetParamsColon(2));
++                pChan->SetModes(Message.GetParam(2), Message.GetParamsSplit(3));
+ 
+                 // We don't SetModeKnown(true) here,
+                 // because a 329 will follow
+diff --git a/src/Message.cpp b/src/Message.cpp
+index 6242e42..0dd0244 100644
+--- a/src/Message.cpp
++++ b/src/Message.cpp
+@@ -267,3 +267,23 @@ void CMessage::InitType() {
+         }
+     }
+ }
++
++VCString CMessage::GetParamsSplit(unsigned int uIdx, unsigned int uLen) const {
++    VCString splitParams;
++    const VCString &params = GetParams();
++
++    if (params.empty() || uLen == 0 || uIdx >= params.size()) {
++        return splitParams;
++    }
++
++    if (uLen > params.size() - uIdx - 1) {
++        uLen = params.size() - uIdx;
++    }
++
++    VCString::const_iterator startIt = params.begin() + uIdx;
++    VCString::const_iterator endIt = startIt + uLen;
++
++    splitParams.assign(startIt, endIt);
++
++    return splitParams;
++}
+diff --git a/test/IRCSockTest.cpp b/test/IRCSockTest.cpp
+index 023cc22..bc96efd 100644
+--- a/test/IRCSockTest.cpp
++++ b/test/IRCSockTest.cpp
+@@ -330,6 +330,23 @@ TEST_F(IRCSockTest, OnPartMessage) {
+     EXPECT_THAT(m_pTestModule->vChannels, ElementsAre(m_pTestChan));
+ }
+ 
++TEST_F(IRCSockTest, StatusModes) {
++    m_pTestSock->ReadLine(":server 005 user PREFIX=(Yohv)!@%+ :are supported by this server");
++
++    EXPECT_TRUE(m_pTestSock->IsPermMode('Y'));
++    EXPECT_TRUE(m_pTestSock->IsPermMode('o'));
++    EXPECT_TRUE(m_pTestSock->IsPermMode('h'));
++    EXPECT_TRUE(m_pTestSock->IsPermMode('v'));
++
++    m_pTestChan->SetModes("+sp");
++    m_pTestChan->ModeChange("+Y :nick");
++    EXPECT_EQ(m_pTestChan->GetModeString(), "+ps");
++
++    const CNick& pNick = m_pTestChan->GetNicks().at("nick");
++    EXPECT_TRUE(pNick.HasPerm('!'));
++    EXPECT_FALSE(pNick.HasPerm('@'));
++}
++
+ TEST_F(IRCSockTest, OnPingMessage) {
+     CMessage msg(":server PING :arg");
+     m_pTestSock->ReadLine(msg.ToString());
+diff --git a/test/MessageTest.cpp b/test/MessageTest.cpp
+index 37a0eb6..e7ad204 100644
+--- a/test/MessageTest.cpp
++++ b/test/MessageTest.cpp
+@@ -21,6 +21,7 @@
+ 
+ using ::testing::IsEmpty;
+ using ::testing::ContainerEq;
++using ::testing::ElementsAre;
+ 
+ TEST(MessageTest, SetParam) {
+     CMessage msg;
+@@ -70,6 +71,42 @@ TEST(MessageTest, GetParams) {
+     EXPECT_EQ(CMessage("CMD p1 :p2 p3").GetParams(-1, 10), "");
+ }
+ 
++TEST(MessageTest, GetParamsSplit) {
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(0), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(1), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(-1), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(0, 0), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(1, 0), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(-1, 0), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(0, 1), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(1, 1), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(-1, 1), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(0, 10), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(1, 10), IsEmpty());
++    EXPECT_THAT(CMessage("CMD").GetParamsSplit(-1, 10), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(0), ElementsAre("p1", "p2 p3"));
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(1), ElementsAre("p2 p3"));
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(-1), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(0, 0), IsEmpty());
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(1, 0), IsEmpty());
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(-1, 0), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(0, 1), ElementsAre("p1"));
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(1, 1), ElementsAre("p2 p3"));
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(-1, 1), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(0, 10), ElementsAre("p1", "p2 p3"));
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(1, 10), ElementsAre("p2 p3"));
++    EXPECT_THAT(CMessage("CMD p1 :p2 p3").GetParamsSplit(-1, 10), IsEmpty());
++
++    EXPECT_THAT(CMessage("CMD p1 :").GetParamsSplit(0), ElementsAre("p1", ""));
++}
++
+ TEST(MessageTest, ToString) {
+     EXPECT_EQ(CMessage("CMD").ToString(), "CMD");
+     EXPECT_EQ(CMessage("CMD p1").ToString(), "CMD p1");
+@@ -358,7 +395,14 @@ TEST(MessageTest, Mode) {
+     msg.Parse(":nick MODE nick :+i");
+     EXPECT_EQ(msg.GetModes(), "+i");
+ 
++    EXPECT_EQ(msg.GetModeList(), "+i");
++
+     EXPECT_EQ(msg.ToString(), ":nick MODE nick :+i");
++
++    msg.Parse(":nick MODE nick +ov Person :Other");
++
++    EXPECT_EQ(msg.GetModeList(), "+ov");
++    EXPECT_THAT(msg.GetModeParams(), ElementsAre("Person", "Other"));
+ }
+ 
+ TEST(MessageTest, Nick) {
